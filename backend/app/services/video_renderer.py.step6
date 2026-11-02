@@ -1,0 +1,611 @@
+import shutil
+import subprocess
+import textwrap
+from pathlib import Path
+from typing import Any
+
+
+PROJECT_ROOT = Path(__file__).resolve().parents[3]
+OUTPUT_DIR = PROJECT_ROOT / "backend" / "outputs"
+
+FFMPEG_PATH = "/opt/homebrew/opt/ffmpeg-full/bin/ffmpeg"
+
+WIDTH = 1080
+HEIGHT = 1920
+FPS = 30
+
+SCENE_DURATION = 4.0
+TRANSITION_DURATION = 0.8
+
+# Gentle cinematic zoom.
+ZOOM_INCREMENT = 0.0006
+MAX_ZOOM = 1.07
+
+
+def _find_font() -> str:
+    """Find an installed font suitable for video captions."""
+
+    candidates = [
+        "/System/Library/Fonts/Supplemental/Arial.ttf",
+        "/System/Library/Fonts/Supplemental/Helvetica.ttf",
+        "/System/Library/Fonts/Helvetica.ttc",
+        "/Library/Fonts/Arial.ttf",
+    ]
+
+    for candidate in candidates:
+        if Path(candidate).is_file():
+            return candidate
+
+    return ""
+
+
+def _escape_filter_path(value: str) -> str:
+    """Escape a filesystem path used in an FFmpeg filter."""
+
+    value = str(value)
+    value = value.replace("\\", "\\\\")
+    value = value.replace(":", "\\:")
+    value = value.replace("'", "\\'")
+    value = value.replace(",", "\\,")
+    value = value.replace("[", "\\[")
+    value = value.replace("]", "\\]")
+    return value
+
+
+def _clean_text(value: Any, fallback: str = "") -> str:
+    """Normalize text used in captions."""
+
+    result = " ".join(str(value or "").split())
+    return result if result else fallback
+
+
+def _wrap_text(value: str, width: int = 30) -> str:
+    """Wrap long text into multiple lines."""
+
+    value = _clean_text(value)
+
+    if not value:
+        return ""
+
+    return "\n".join(
+        textwrap.wrap(
+            value,
+            width=width,
+            break_long_words=True,
+            break_on_hyphens=False,
+        )
+    )
+
+
+def _write_text_file(
+    directory: Path,
+    filename: str,
+    content: str,
+) -> Path:
+    """Write caption text to a UTF-8 file."""
+
+    path = directory / filename
+    path.write_text(content, encoding="utf-8")
+    return path
+
+
+def _run_ffmpeg(command: list[str]) -> None:
+    """Execute FFmpeg and report rendering errors."""
+
+    result = subprocess.run(
+        command,
+        capture_output=True,
+        text=True,
+        timeout=600,
+        check=False,
+    )
+
+    if result.returncode != 0:
+        raise RuntimeError(
+            "FFmpeg failed to render the property video.\n"
+            + result.stderr[-6000:]
+        )
+
+
+def render_property_video(
+    image_paths: list[str],
+    storyboard: dict[str, Any],
+    output_filename: str,
+) -> str:
+    """
+    Render a vertical real-estate promotional video.
+
+    Features:
+    - 1080 x 1920 portrait video
+    - Aspect-ratio-preserving image fitting
+    - No forced cropping during initial image fitting
+    - Gentle cinematic zoom
+    - Smooth crossfade transitions
+    - Scene headlines and captions
+    - Property information and contact details
+    - H.264 MP4 output
+
+    Returns:
+        Absolute path to the generated MP4.
+    """
+
+    # --------------------------------------------------
+    # Validate inputs
+    # --------------------------------------------------
+
+    if not 4 <= len(image_paths) <= 8:
+        raise ValueError("Upload between 4 and 8 property photos.")
+
+    if not Path(FFMPEG_PATH).is_file():
+        raise RuntimeError(
+            f"FFmpeg was not found at {FFMPEG_PATH}. "
+            "Check FFMPEG_PATH."
+        )
+
+    for image_path in image_paths:
+        if not Path(image_path).is_file():
+            raise FileNotFoundError(
+                f"Property image not found: {image_path}"
+            )
+
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+    output_filename = Path(output_filename).name
+
+    if not output_filename.lower().endswith(".mp4"):
+        output_filename += ".mp4"
+
+    output_path = OUTPUT_DIR / output_filename
+
+    # --------------------------------------------------
+    # Extract property information
+    # --------------------------------------------------
+
+    property_name = _clean_text(
+        storyboard.get("property_name"),
+        "EXCLUSIVE PROPERTY",
+    )
+
+    location = _clean_text(storyboard.get("location"))
+    price = _clean_text(storyboard.get("price"))
+    property_type = _clean_text(storyboard.get("property_type"))
+    contact = _clean_text(storyboard.get("contact"))
+
+    call_to_action = _clean_text(
+        storyboard.get("call_to_action"),
+        "ENQUIRE TODAY",
+    )
+
+    features = storyboard.get("features", [])
+
+    if isinstance(features, str):
+        features = [
+            item.strip()
+            for item in features.split(",")
+            if item.strip()
+        ]
+
+    if not isinstance(features, list):
+        features = []
+
+    features = [
+        str(item).strip()
+        for item in features
+        if str(item).strip()
+    ]
+
+    # --------------------------------------------------
+    # Prepare scene captions
+    # --------------------------------------------------
+
+    storyboard_scenes = storyboard.get("scenes", [])
+
+    fallback_headlines = [
+        "A HOME THAT INSPIRES",
+        "SPACE TO LIVE BEAUTIFULLY",
+        "DESIGNED FOR COMFORT",
+        "DETAILS THAT MAKE A DIFFERENCE",
+        "YOUR NEXT CHAPTER STARTS HERE",
+        "DISCOVER SOMETHING SPECIAL",
+        "MADE FOR THE WAY YOU LIVE",
+        "YOUR DREAM HOME AWAITS",
+    ]
+
+    caption_data: list[tuple[str, str]] = []
+
+    for index in range(len(image_paths)):
+        scene = (
+            storyboard_scenes[index]
+            if index < len(storyboard_scenes)
+            and isinstance(storyboard_scenes[index], dict)
+            else {}
+        )
+
+        headline = _clean_text(
+            scene.get("headline"),
+            fallback_headlines[index % len(fallback_headlines)],
+        )
+
+        caption = _clean_text(scene.get("caption"))
+
+        caption_data.append((headline, caption))
+
+    # --------------------------------------------------
+    # Calculate timing
+    # --------------------------------------------------
+
+    scene_count = len(image_paths)
+
+    total_duration = (
+        scene_count * SCENE_DURATION
+        - (scene_count - 1) * TRANSITION_DURATION
+    )
+
+    total_frames = round(total_duration * FPS)
+
+    font_path = _find_font()
+
+    work_dir = OUTPUT_DIR / f".render_{output_path.stem}"
+    work_dir.mkdir(parents=True, exist_ok=True)
+
+    try:
+        # --------------------------------------------------
+        # Prepare FFmpeg inputs
+        # --------------------------------------------------
+
+        command = [
+            FFMPEG_PATH,
+            "-hide_banner",
+            "-y",
+            "-loglevel",
+            "error",
+        ]
+
+        for image_path in image_paths:
+            command.extend(
+                [
+                    "-loop",
+                    "1",
+                    "-framerate",
+                    str(FPS),
+                    "-t",
+                    str(SCENE_DURATION),
+                    "-i",
+                    image_path,
+                ]
+            )
+
+        filter_parts: list[str] = []
+
+        # --------------------------------------------------
+        # Create image scenes
+        # --------------------------------------------------
+        #
+        # IMPORTANT:
+        # force_original_aspect_ratio=decrease fits the image
+        # inside the portrait frame without enlarging it until
+        # the sides are cropped.
+        #
+        # pad fills the unused space while preserving the
+        # original image proportions.
+        #
+        # --------------------------------------------------
+
+        for index in range(scene_count):
+            filter_parts.append(
+                f"[{index}:v]"
+                f"scale={WIDTH}:{HEIGHT}:"
+                "force_original_aspect_ratio=decrease:"
+                "force_divisible_by=2,"
+                "setsar=1,"
+                f"pad={WIDTH}:{HEIGHT}:"
+                "(ow-iw)/2:(oh-ih)/2:"
+                "color=black,"
+                f"fps={FPS},"
+                "zoompan="
+f"z='if(lte(on,1),1,"
+f"if(eq(mod({index},2),0),"
+f"min(zoom+{ZOOM_INCREMENT},{MAX_ZOOM}),"
+f"max(zoom-{ZOOM_INCREMENT},1)))':"
+"x='iw/2-(iw/zoom/2)':"
+"y='ih/2-(ih/zoom/2)':"
+"d=1:"
+f"s={WIDTH}x{HEIGHT}:"
+f"fps={FPS},"
+                f"trim=duration={SCENE_DURATION},"
+                "setpts=PTS-STARTPTS,"
+                "format=yuv420p"
+                f"[scene{index}]"
+            )
+
+        # --------------------------------------------------
+        # Crossfade transitions
+        # --------------------------------------------------
+
+        current_label = "scene0"
+        elapsed_duration = SCENE_DURATION
+
+        for index in range(1, scene_count):
+            output_label = f"transition{index}"
+
+            offset = elapsed_duration - TRANSITION_DURATION
+
+            filter_parts.append(
+                f"[{current_label}][scene{index}]"
+                "xfade="
+                "transition=fade:"
+                f"duration={TRANSITION_DURATION}:"
+                f"offset={offset:.3f}"
+                f"[{output_label}]"
+            )
+
+            current_label = output_label
+
+            elapsed_duration += (
+                SCENE_DURATION - TRANSITION_DURATION
+            )
+
+        # --------------------------------------------------
+        # Font configuration
+        # --------------------------------------------------
+
+        font_option = ""
+
+        if font_path:
+            escaped_font = _escape_filter_path(font_path)
+            font_option = f":fontfile='{escaped_font}'"
+
+        # --------------------------------------------------
+        # Persistent brand label
+        # --------------------------------------------------
+
+        brand_path = _write_text_file(
+            work_dir,
+            "brand.txt",
+            "DWELLREEL  /  PROPERTY FILM",
+        )
+
+        escaped_brand_path = _escape_filter_path(str(brand_path))
+
+        filter_parts.append(
+            f"[{current_label}]"
+            "drawtext="
+            f"textfile='{escaped_brand_path}'"
+            f"{font_option}:"
+"fontcolor=white@0.95:"
+"fontsize=24:"
+"x=72:"
+"y=100:"
+"shadowcolor=black@0.55:"
+"shadowx=1:"
+"shadowy=2"
+            "[brand]"
+        )
+
+        current_label = "brand"
+
+        # --------------------------------------------------
+        # Scene headlines and supporting captions
+        # --------------------------------------------------
+
+        for index, (headline, caption) in enumerate(caption_data):
+            start_time = index * (
+                SCENE_DURATION - TRANSITION_DURATION
+            )
+
+            end_time = min(
+                start_time + SCENE_DURATION,
+                total_duration,
+            )
+
+            fade_in_end = min(start_time + 0.35, end_time)
+            fade_out_start = max(end_time - 0.30, start_time)
+
+            headline_path = _write_text_file(
+                work_dir,
+                f"headline_{index}.txt",
+                _wrap_text(headline.upper(), width=27),
+            )
+
+            escaped_headline_path = _escape_filter_path(
+                str(headline_path)
+            )
+
+            # Translucent caption panel.
+            panel_label = f"panel{index}"
+
+            filter_parts.append(
+                f"[{current_label}]"
+                "drawbox="
+                "x=48:"
+                "y=1280:"
+                "w=984:"
+                "h=420:"
+                "color=black@0.45:"
+                "t=fill:"
+                f"enable='between(t,{start_time:.3f},{end_time:.3f})'"
+                f"[{panel_label}]"
+            )
+
+            current_label = panel_label
+
+            # Headline.
+            headline_label = f"headline{index}"
+
+            filter_parts.append(
+                f"[{current_label}]"
+                "drawtext="
+                f"textfile='{escaped_headline_path}'"
+                f"{font_option}:"
+                "fontcolor=white:"
+"fontsize=60:"
+"line_spacing=15:"
+"x=80:"
+"y=1360:"
+"shadowcolor=black@0.65:"
+"shadowx=1:"
+"shadowy=2:"
+                "shadowy=3:"
+                "alpha="
+                f"'if(lt(t,{fade_in_end:.3f}),"
+                f"(t-{start_time:.3f})/0.35,"
+                f"if(gt(t,{fade_out_start:.3f}),"
+                f"({end_time:.3f}-t)/0.30,1))':"
+                f"enable='between(t,{start_time:.3f},{end_time:.3f})'"
+                f"[{headline_label}]"
+            )
+
+            current_label = headline_label
+
+            # Supporting caption.
+            if caption:
+                caption_path = _write_text_file(
+                    work_dir,
+                    f"caption_{index}.txt",
+                    _wrap_text(caption, width=43),
+                )
+
+                escaped_caption_path = _escape_filter_path(
+                    str(caption_path)
+                )
+
+                caption_label = f"caption{index}"
+
+                filter_parts.append(
+                    f"[{current_label}]"
+                    "drawtext="
+                    f"textfile='{escaped_caption_path}'"
+                    f"{font_option}:"
+                    "fontcolor=white@0.92:"
+"fontsize=29:"
+"line_spacing=12:"
+"x=80:"
+"y=1515:"
+"shadowcolor=black@0.55:"
+"shadowx=1:"
+"shadowy=2:"
+                    f"enable='between(t,{start_time:.3f},{end_time:.3f})'"
+                    f"[{caption_label}]"
+                )
+
+                current_label = caption_label
+
+        # --------------------------------------------------
+        # Closing information panel
+        # --------------------------------------------------
+
+        closing_start = max(total_duration - 3.2, 0.0)
+
+        closing_lines = [property_name.upper()]
+
+        if property_type:
+            closing_lines.append(property_type.upper())
+
+        if location:
+            closing_lines.append(location)
+
+        if price:
+            closing_lines.append(price)
+
+        if features:
+            closing_lines.append("  |  ".join(features[:3]))
+
+        closing_lines.append(call_to_action.upper())
+
+        if contact:
+            closing_lines.append(f"CONTACT: {contact}")
+
+        closing_text = "\n\n".join(closing_lines)
+
+        closing_path = _write_text_file(
+            work_dir,
+            "closing.txt",
+            _wrap_text(closing_text, width=34),
+        )
+
+        escaped_closing_path = _escape_filter_path(
+            str(closing_path)
+        )
+
+        filter_parts.append(
+            f"[{current_label}]"
+            "drawbox="
+            "x=40:"
+            "y=1440:"
+            "w=1000:"
+            "h=400:"
+            "color=black@0.72:"
+            "t=fill:"
+            f"enable='between(t,{closing_start:.3f},{total_duration:.3f})'"
+            "[closingpanel]"
+        )
+
+        filter_parts.append(
+            "[closingpanel]"
+            "drawtext="
+            f"textfile='{escaped_closing_path}'"
+            f"{font_option}:"
+            "fontcolor=white:"
+            "fontsize=29:"
+            "line_spacing=12:"
+            "x=75:"
+            "y=1480:"
+            "shadowcolor=black@0.65:"
+            "shadowx=2:"
+            "shadowy=2:"
+            f"enable='between(t,{closing_start:.3f},{total_duration:.3f})'"
+            "[outv]"
+        )
+
+        # --------------------------------------------------
+        # Render the MP4
+        # --------------------------------------------------
+
+        command.extend(
+            [
+                "-filter_complex",
+                ";".join(filter_parts),
+                "-map",
+                "[outv]",
+                "-an",
+                "-frames:v",
+                str(total_frames),
+                "-r",
+                str(FPS),
+                "-c:v",
+                "libx264",
+                "-preset",
+                "medium",
+                "-crf",
+                "19",
+                "-pix_fmt",
+                "yuv420p",
+                "-movflags",
+                "+faststart",
+                "-metadata",
+                f"title={property_name}",
+                "-metadata",
+                "comment=Created with DwellReel AI",
+                str(output_path),
+            ]
+        )
+
+        _run_ffmpeg(command)
+
+        # --------------------------------------------------
+        # Verify the generated MP4
+        # --------------------------------------------------
+
+        if (
+            not output_path.is_file()
+            or output_path.stat().st_size == 0
+        ):
+            raise RuntimeError(
+                "The video renderer did not produce a valid MP4 file."
+            )
+
+        return str(output_path.resolve())
+
+    finally:
+        # Remove temporary caption files without deleting the video.
+        shutil.rmtree(work_dir, ignore_errors=True)

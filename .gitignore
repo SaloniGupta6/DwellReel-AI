@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.Python
+.venv/
+venv/
+env/
+
+# Environment variables and secrets
+.env
+.env.*
+!.env.example
+
+# Node
+node_modules/
+dist/
+build/
+
+# IDE and OS
+.DS_Store
+.idea/
+.vscode/
+
+# Python testing/cache
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Temporary uploads and generated files
+backend/uploads/*
+backend/outputs/*
+!backend/outputs/sample_property_video.mp4
+
+# Logs
+*.log
